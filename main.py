@@ -6,6 +6,7 @@ import secrets
 import time
 import aiofiles
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from collections import deque, defaultdict
 from pathlib import Path
@@ -19,6 +20,8 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("RVG-Gateway")
+
+IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 app = FastAPI(title="RVG Gateway - codebox", docs_url=None, redoc_url=None)
 
@@ -171,6 +174,9 @@ def get_host() -> str:
 def generate_uuid() -> str:
     h = secrets.token_hex(16)
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+    
+def now_ir() -> datetime:
+    return datetime.now(IRAN_TZ)
 
 def generate_vless_link(uuid: str, host: str, remark: str = "RVG", protocol: str = DEFAULT_PROTOCOL) -> str:
     """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده (WS کلاسیک یا یکی از مدهای XHTTP)."""
@@ -760,7 +766,7 @@ async def http_proxy(target_url: str, request: Request):
         resp = await http_client.request(method=request.method, url=target_url, headers=headers, content=body)
         stats["total_bytes"] += len(resp.content)
         stats["total_requests"] += 1
-        hourly_traffic[datetime.now().strftime("%H:00")] += len(resp.content)
+        hourly_traffic[now_ir().strftime("%H:00")] += len(resp.content)
         return Response(content=resp.content, status_code=resp.status_code,
                         headers={k: v for k, v in resp.headers.items() if k.lower() not in _HOP})
     except Exception as exc:
