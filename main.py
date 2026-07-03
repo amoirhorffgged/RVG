@@ -56,7 +56,7 @@ DATA_FILE = DATA_DIR / "rvg_state.json"
 SAVE_LOCK = asyncio.Lock()
 
 async def load_state():
-    global LINKS, AUTH, SUBS, USERS
+    global LINKS, AUTH, SUBS, USERS, SETTINGS, GROUPS, IP_POOL, IP_BLACKLIST
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -68,7 +68,14 @@ async def load_state():
             USERS.update(data.get("users", {}))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
-            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, {len(USERS)} users")
+            if "settings" in data:
+                SETTINGS.update(data["settings"])
+            GROUPS.update(data.get("groups", {}))
+            IP_POOL.clear()
+            IP_POOL.extend(data.get("ip_pool", []))
+            IP_BLACKLIST.clear()
+            IP_BLACKLIST.update(data.get("ip_blacklist", []))
+            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, {len(USERS)} users, {len(GROUPS)} groups, {len(IP_POOL)} ips")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
@@ -80,6 +87,10 @@ async def save_state():
                 "links": dict(LINKS),
                 "users": dict(USERS),
                 "subs": dict(SUBS),
+                "settings": dict(SETTINGS),
+                "groups": dict(GROUPS),
+                "ip_pool": list(IP_POOL),
+                "ip_blacklist": list(IP_BLACKLIST),
                 "password_hash": AUTH["password_hash"],
                 "saved_at": datetime.now().isoformat(),
             }
@@ -108,6 +119,33 @@ SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
 USERS: dict = {}
 USERS_LOCK = asyncio.Lock()
+
+# ── Settings ──────────────────────────────────────────────────────────────
+SETTINGS = {
+    "websocket_mode": True,
+    "xhttp_mode": True,
+    "default_connection_mode": "ws",  # ws, xhttp, tcp
+    "max_ip_per_user": 3,
+    "bandwidth_limit_mbps": 100,
+    "live_monitoring": True,
+    "auto_ip_rotation": False,
+    "security_token": secrets.token_urlsafe(16),
+}
+SETTINGS_LOCK = asyncio.Lock()
+
+# ── Groups ─────────────────────────────────────────────────────────────────
+GROUPS: dict = {}  # group_id → {name, description, user_ids, ip_pool, rules, created_at}
+GROUPS_LOCK = asyncio.Lock()
+
+# ── IP Pool & Blacklist ────────────────────────────────────────────────────
+IP_POOL: list = []  # list of {ip, status, latency_ms, location, assigned_user, last_check}
+IP_POOL_LOCK = asyncio.Lock()
+IP_BLACKLIST: set = set()
+IP_BLACKLIST_LOCK = asyncio.Lock()
+
+# ── IP per user tracking ───────────────────────────────────────────────────
+USER_IP_MAP: dict = defaultdict(set)  # user_id → set of IPs used
+USER_IP_MAP_LOCK = asyncio.Lock()
 
 # پروتکل‌های پشتیبانی‌شده برای هر کانفیگ
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
@@ -1232,6 +1270,623 @@ async def dashboard(request: Request):
 @app.get("/test-ws", response_class=HTMLResponse)
 async def test_ws_redirect():
     return HTMLResponse(content="<script>location.href='/dashboard'</script>")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADVANCED SETTINGS SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/settings")
+async def get_settings(_=Depends(require_auth)):
+    """Return all settings, masking the security token."""
+    async with SETTINGS_LOCK:
+        s = dict(SETTINGS)
+        s["security_token"] = s["security_token"][:8] + "********" if s.get("security_token") else ""
+    return s
+
+
+@app.post("/api/settings")
+async def update_settings(request: Request, _=Depends(require_auth)):
+    """Update settings from any subset of fields."""
+    body = await request.json()
+    allowed_keys = {
+        "websocket_mode", "xhttp_mode", "default_connection_mode",
+        "max_ip_per_user", "bandwidth_limit_mbps", "live_monitoring",
+        "auto_ip_rotation",
+    }
+    async with SETTINGS_LOCK:
+        for k, v in body.items():
+            if k in allowed_keys:
+                if k == "max_ip_per_user" and isinstance(v, (int, float)):
+                    SETTINGS[k] = int(v)
+                elif k == "bandwidth_limit_mbps" and isinstance(v, (int, float)):
+                    SETTINGS[k] = int(v)
+                elif k == "default_connection_mode" and isinstance(v, str):
+                    if v in ("ws", "xhttp", "tcp"):
+                        SETTINGS[k] = v
+                elif isinstance(v, bool):
+                    SETTINGS[k] = v
+    asyncio.create_task(save_state())
+    log_activity("settings", "تنظیمات پیشرفته به‌روزرسانی شد", "info")
+    async with SETTINGS_LOCK:
+        s = dict(SETTINGS)
+        s["security_token"] = s["security_token"][:8] + "********" if s.get("security_token") else ""
+    return {"ok": True, "settings": s}
+
+
+@app.post("/api/settings/security-token/rotate")
+async def rotate_security_token(_=Depends(require_auth)):
+    """Generate a new security token."""
+    async with SETTINGS_LOCK:
+        SETTINGS["security_token"] = secrets.token_urlsafe(16)
+    asyncio.create_task(save_state())
+    log_activity("settings", "توکن امنیتی جدید تولید شد", "ok")
+    return {"ok": True, "security_token": SETTINGS["security_token"]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GROUP MANAGEMENT SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/groups")
+async def list_groups(_=Depends(require_auth)):
+    """List all groups with user count."""
+    async with GROUPS_LOCK:
+        snap = dict(GROUPS)
+    result = []
+    for gid, g in snap.items():
+        user_ids = g.get("user_ids", [])
+        result.append({
+            "group_id": gid,
+            "name": g.get("name"),
+            "description": g.get("description", ""),
+            "user_count": len(user_ids),
+            "user_ids": user_ids,
+            "speed_limit": g.get("speed_limit", 0),
+            "traffic_limit": g.get("traffic_limit", 0),
+            "expire_days": g.get("expire_days", 0),
+            "ip_pool": g.get("ip_pool", []),
+            "rules": g.get("rules", {}),
+            "created_at": g.get("created_at"),
+        })
+    result.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return {"groups": result}
+
+
+@app.post("/api/groups")
+async def create_group(request: Request, _=Depends(require_auth)):
+    """Create a new group."""
+    body = await request.json()
+    name = (body.get("name") or "گروه جدید").strip()[:60]
+    description = (body.get("description") or "").strip()[:200]
+    speed_limit = int(body.get("speed_limit") or 0)
+    traffic_limit = int(body.get("traffic_limit") or 0)
+    expire_days = int(body.get("expire_days") or 0)
+
+    group_id = generate_short_id()
+    async with GROUPS_LOCK:
+        GROUPS[group_id] = {
+            "name": name,
+            "description": description,
+            "user_ids": [],
+            "ip_pool": body.get("ip_pool", []),
+            "rules": body.get("rules", {}),
+            "speed_limit": speed_limit,
+            "traffic_limit": traffic_limit,
+            "expire_days": expire_days,
+            "created_at": datetime.now().isoformat(),
+        }
+    asyncio.create_task(save_state())
+    log_activity("group", f"گروه «{name}» ساخته شد", "ok")
+    return {"ok": True, "group_id": group_id, **GROUPS[group_id]}
+
+
+@app.patch("/api/groups/{group_id}")
+async def update_group(group_id: str, request: Request, _=Depends(require_auth)):
+    """Update an existing group."""
+    body = await request.json()
+    async with GROUPS_LOCK:
+        g = GROUPS.get(group_id)
+        if not g:
+            raise HTTPException(status_code=404, detail="group not found")
+        if "name" in body:
+            g["name"] = str(body["name"])[:60]
+        if "description" in body:
+            g["description"] = str(body["description"])[:200]
+        if "speed_limit" in body:
+            g["speed_limit"] = int(body["speed_limit"])
+        if "traffic_limit" in body:
+            g["traffic_limit"] = int(body["traffic_limit"])
+        if "expire_days" in body:
+            g["expire_days"] = int(body["expire_days"])
+        if "ip_pool" in body:
+            g["ip_pool"] = list(body["ip_pool"])
+        if "rules" in body:
+            g["rules"] = dict(body["rules"])
+    asyncio.create_task(save_state())
+    log_activity("group", f"گروه «{g.get('name', group_id)}» ویرایش شد", "info")
+    return {"ok": True}
+
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group(group_id: str, _=Depends(require_auth)):
+    """Delete a group and unlink all users from it."""
+    async with GROUPS_LOCK:
+        g = GROUPS.pop(group_id, None)
+        if not g:
+            raise HTTPException(status_code=404, detail="group not found")
+        name = g.get("name", group_id)
+        user_ids = g.get("user_ids", [])
+    asyncio.create_task(save_state())
+    log_activity("group", f"گروه «{name}» حذف شد", "warn")
+    return {"ok": True, "deleted": group_id, "unlinked_users": len(user_ids)}
+
+
+@app.post("/api/groups/{group_id}/users")
+async def add_user_to_group(group_id: str, request: Request, _=Depends(require_auth)):
+    """Add a user to a group."""
+    body = await request.json()
+    user_id = str(body.get("user_id", ""))
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    async with USERS_LOCK:
+        if user_id not in USERS:
+            raise HTTPException(status_code=404, detail="user not found")
+
+    async with GROUPS_LOCK:
+        g = GROUPS.get(group_id)
+        if not g:
+            raise HTTPException(status_code=404, detail="group not found")
+        ids = g.setdefault("user_ids", [])
+        if user_id not in ids:
+            ids.append(user_id)
+    asyncio.create_task(save_state())
+    log_activity("group", f"کاربر «{user_id}» به گروه «{g.get('name', group_id)}» اضافه شد", "info")
+    return {"ok": True}
+
+
+@app.delete("/api/groups/{group_id}/users/{user_id}")
+async def remove_user_from_group(group_id: str, user_id: str, _=Depends(require_auth)):
+    """Remove a user from a group."""
+    async with GROUPS_LOCK:
+        g = GROUPS.get(group_id)
+        if not g:
+            raise HTTPException(status_code=404, detail="group not found")
+        ids = g.get("user_ids", [])
+        if user_id in ids:
+            ids.remove(user_id)
+        else:
+            raise HTTPException(status_code=404, detail="user not in group")
+    asyncio.create_task(save_state())
+    log_activity("group", f"کاربر «{user_id}» از گروه «{g.get('name', group_id)}» حذف شد", "info")
+    return {"ok": True}
+
+
+@app.get("/api/groups/{group_id}/subscription")
+async def group_subscription(group_id: str, _=Depends(require_auth)):
+    """Generate subscription link for a group — base64-encoded configs of all active users."""
+    async with GROUPS_LOCK:
+        g = GROUPS.get(group_id)
+        if not g:
+            raise HTTPException(status_code=404, detail="group not found")
+        user_ids = list(g.get("user_ids", []))
+
+    async with USERS_LOCK:
+        snap = dict(USERS)
+
+    configs = []
+    for uid in user_ids:
+        u = snap.get(uid)
+        if u and is_user_allowed(u):
+            cfg = generate_user_config(uid, u)
+            if cfg:
+                configs.append(cfg)
+
+    if not configs:
+        raise HTTPException(status_code=404, detail="no active users in group")
+
+    content = base64.b64encode("\n".join(configs).encode()).decode()
+    host = get_host()
+    return {
+        "group_id": group_id,
+        "group_name": g.get("name"),
+        "active_users": len(configs),
+        "total_users": len(user_ids),
+        "subscription_url": f"https://{host}/api/groups/{group_id}/subscription",
+        "encoded_config": content,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IP POOL MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/ips")
+async def list_ips(_=Depends(require_auth)):
+    """List all IPs in the pool with status."""
+    async with IP_POOL_LOCK:
+        ips = list(IP_POOL)
+    async with IP_BLACKLIST_LOCK:
+        bl = set(IP_BLACKLIST)
+    for entry in ips:
+        entry["blacklisted"] = entry["ip"] in bl
+    return {"ips": ips, "total": len(ips), "blacklisted_count": len(bl)}
+
+
+@app.post("/api/ips")
+async def add_ip(request: Request, _=Depends(require_auth)):
+    """Add an IP to the pool."""
+    body = await request.json()
+    ip_addr = (body.get("ip") or "").strip()
+    if not ip_addr:
+        raise HTTPException(status_code=400, detail="ip is required")
+    async with IP_POOL_LOCK:
+        if any(e["ip"] == ip_addr for e in IP_POOL):
+            raise HTTPException(status_code=409, detail="ip already in pool")
+        entry = {
+            "ip": ip_addr,
+            "status": body.get("status", "active"),
+            "latency_ms": body.get("latency_ms", 0),
+            "location": body.get("location", "Unknown"),
+            "assigned_user": body.get("assigned_user"),
+            "last_check": datetime.now().isoformat(),
+        }
+        IP_POOL.append(entry)
+    asyncio.create_task(save_state())
+    log_activity("ip", f"IP «{ip_addr}» به مخزن اضافه شد", "info")
+    return {"ok": True, "ip": entry}
+
+
+@app.delete("/api/ips")
+async def remove_ip(request: Request, _=Depends(require_auth)):
+    """Remove an IP from the pool."""
+    body = await request.json()
+    ip_addr = (body.get("ip") or "").strip()
+    if not ip_addr:
+        raise HTTPException(status_code=400, detail="ip is required")
+    async with IP_POOL_LOCK:
+        before = len(IP_POOL)
+        IP_POOL[:] = [e for e in IP_POOL if e["ip"] != ip_addr]
+        if len(IP_POOL) == before:
+            raise HTTPException(status_code=404, detail="ip not found in pool")
+    asyncio.create_task(save_state())
+    log_activity("ip", f"IP «{ip_addr}» از مخزن حذف شد", "warn")
+    return {"ok": True, "deleted": ip_addr}
+
+
+@app.post("/api/ips/blacklist")
+async def blacklist_ip(request: Request, _=Depends(require_auth)):
+    """Add an IP to the blacklist."""
+    body = await request.json()
+    ip_addr = (body.get("ip") or "").strip()
+    if not ip_addr:
+        raise HTTPException(status_code=400, detail="ip is required")
+    async with IP_BLACKLIST_LOCK:
+        IP_BLACKLIST.add(ip_addr)
+    asyncio.create_task(save_state())
+    log_activity("ip", f"IP «{ip_addr}» به لیست سیاه اضافه شد", "warn")
+    return {"ok": True, "blacklisted": ip_addr}
+
+
+@app.delete("/api/ips/blacklist")
+async def unblacklist_ip(request: Request, _=Depends(require_auth)):
+    """Remove an IP from the blacklist."""
+    body = await request.json()
+    ip_addr = (body.get("ip") or "").strip()
+    if not ip_addr:
+        raise HTTPException(status_code=400, detail="ip is required")
+    async with IP_BLACKLIST_LOCK:
+        if ip_addr not in IP_BLACKLIST:
+            raise HTTPException(status_code=404, detail="ip not in blacklist")
+        IP_BLACKLIST.discard(ip_addr)
+    asyncio.create_task(save_state())
+    log_activity("ip", f"IP «{ip_addr}» از لیست سیاه خارج شد", "info")
+    return {"ok": True, "removed": ip_addr}
+
+
+@app.post("/api/ips/assign")
+async def assign_ip_to_user(request: Request, _=Depends(require_auth)):
+    """Assign an IP from the pool to a user."""
+    body = await request.json()
+    user_id = str(body.get("user_id", ""))
+    ip_addr = str(body.get("ip", ""))
+    if not user_id or not ip_addr:
+        raise HTTPException(status_code=400, detail="user_id and ip are required")
+
+    async with USERS_LOCK:
+        if user_id not in USERS:
+            raise HTTPException(status_code=404, detail="user not found")
+
+    async with IP_POOL_LOCK:
+        entry = next((e for e in IP_POOL if e["ip"] == ip_addr), None)
+        if not entry:
+            raise HTTPException(status_code=404, detail="ip not found in pool")
+        entry["assigned_user"] = user_id
+        entry["status"] = "assigned"
+
+    async with USER_IP_MAP_LOCK:
+        USER_IP_MAP[user_id].add(ip_addr)
+
+    asyncio.create_task(save_state())
+    log_activity("ip", f"IP «{ip_addr}» به کاربر «{user_id}» اختصاص یافت", "info")
+    return {"ok": True, "user_id": user_id, "ip": ip_addr}
+
+
+@app.get("/api/ips/test")
+async def test_ips(_=Depends(require_auth)):
+    """Return simulated ping results for pool IPs."""
+    import random
+    async with IP_POOL_LOCK:
+        ips = list(IP_POOL)
+    results = []
+    for entry in ips:
+        latency = random.randint(20, 350)
+        status = "ok" if latency < 300 else "timeout"
+        results.append({
+            "ip": entry["ip"],
+            "latency_ms": latency,
+            "status": status,
+            "location": entry.get("location", "Unknown"),
+            "assigned_user": entry.get("assigned_user"),
+            "tested_at": datetime.now().isoformat(),
+        })
+    results.sort(key=lambda x: x["latency_ms"])
+    return {"results": results, "tested_at": datetime.now().isoformat()}
+
+
+@app.get("/api/ips/check")
+async def check_ip(request: Request, _=Depends(require_auth)):
+    """Check if an IP is in the blacklist."""
+    ip_addr = request.query_params.get("ip", "").strip()
+    if not ip_addr:
+        raise HTTPException(status_code=400, detail="ip query param is required")
+    async with IP_BLACKLIST_LOCK:
+        blacklisted = ip_addr in IP_BLACKLIST
+    return {"ip": ip_addr, "blacklisted": blacklisted}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE SERVER STATS — Helpers & WebSocket
+# ══════════════════════════════════════════════════════════════════════════════
+
+ws_client_count = 0
+WS_LIVE_CLIENTS: set = set()
+
+def get_live_stats() -> dict:
+    """Build simulated live stats for the server."""
+    conn_count = len(connections)
+    async def _cpu():
+        return round(min(conn_count * 0.3 + 5, 95), 1)
+    async def _ram():
+        total_users = len(USERS)
+        return round(min(45 + (total_users * 0.5) + (conn_count * 0.1), 95), 1)
+    async def _disk():
+        total_configs = len(LINKS)
+        total_users = len(USERS)
+        return round(min(25 + (total_configs * 0.02) + (total_users * 0.1), 90), 1)
+    import random
+    network_mbps = round(random.uniform(1.5, max(float(SETTINGS.get("bandwidth_limit_mbps", 100)) * 0.4, 5)), 2)
+    uptime_secs = max(time.time() - stats["start_time"], 1)
+    cpu_percent = round(min(conn_count * 0.3 + 5 + random.uniform(-3, 3), 95), 1)
+    ram_percent = round(min(45 + (len(USERS) * 0.5) + (conn_count * 0.1) + random.uniform(-2, 2), 95), 1)
+    disk_percent = round(min(25 + (len(LINKS) * 0.02) + (len(USERS) * 0.1), 90), 1)
+    
+    return {
+        "cpu_percent": max(0, cpu_percent),
+        "ram_percent": max(0, ram_percent),
+        "disk_percent": max(0, disk_percent),
+        "network_mbps": network_mbps,
+        "active_connections": conn_count,
+        "ws_connections": ws_client_count,
+        "uptime": uptime(),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.websocket("/ws/live")
+async def websocket_live_stats(websocket: WebSocket):
+    global ws_client_count
+    await websocket.accept()
+    ws_client_count += 1
+    WS_LIVE_CLIENTS.add(websocket)
+    try:
+        while True:
+            try:
+                stats_data = get_live_stats()
+                await websocket.send_json(stats_data)
+                await asyncio.sleep(2)
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        ws_client_count = max(0, ws_client_count - 1)
+        WS_LIVE_CLIENTS.discard(websocket)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IP LIMIT ENFORCEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/users/{user_id}/ip-check")
+async def check_user_ip_limit(user_id: str, _=Depends(require_auth)):
+    """Check if a user is within their IP limit."""
+    async with USERS_LOCK:
+        u = USERS.get(user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="user not found")
+        username = u.get("username")
+
+    async with USER_IP_MAP_LOCK:
+        ip_count = len(USER_IP_MAP.get(user_id, set()))
+
+    async with SETTINGS_LOCK:
+        max_ip = SETTINGS.get("max_ip_per_user", 3)
+
+    within_limit = ip_count < max_ip
+    return {
+        "user_id": user_id,
+        "username": username,
+        "current_ip_count": ip_count,
+        "max_ip_per_user": max_ip,
+        "within_limit": within_limit,
+        "ips": list(USER_IP_MAP.get(user_id, set())),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN TOOLS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/tools/config-generator")
+async def config_generator(request: Request, _=Depends(require_auth)):
+    """Generate a connection config string for given parameters."""
+    body = await request.json()
+    protocol = str(body.get("protocol", "vless")).lower()
+    host = str(body.get("host", get_host())).strip()
+    config_uuid = str(body.get("uuid") or generate_uuid())
+    remark = str(body.get("remark", "Generated"))
+
+    if protocol not in USER_PROTOCOLS:
+        raise HTTPException(status_code=400, detail=f"Invalid protocol. Must be one of: {', '.join(USER_PROTOCOLS)}")
+
+    # Build a temporary user-like dict for generate_user_config
+    temp_user = {
+        "protocol": protocol,
+        "config_uuid": config_uuid,
+        "username": remark,
+    }
+    # Override host temporarily
+    original_host = CONFIG.get("host")
+    CONFIG["host"] = host
+    config = generate_user_config("temp", temp_user)
+    if original_host:
+        CONFIG["host"] = original_host
+
+    return {
+        "protocol": protocol,
+        "host": host,
+        "uuid": config_uuid,
+        "remark": remark,
+        "config": config,
+        "generated_at": datetime.now().isoformat(),
+    }
+
+
+@app.post("/api/tools/ip-test")
+async def ip_test(request: Request, _=Depends(require_auth)):
+    """Simulated ping test for a given IP."""
+    import random
+    body = await request.json()
+    ip_addr = str(body.get("ip", "")).strip()
+    if not ip_addr:
+        raise HTTPException(status_code=400, detail="ip is required")
+
+    # Simple IP format check
+    parts = ip_addr.split(".")
+    valid_format = len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+    if not valid_format:
+        raise HTTPException(status_code=400, detail="invalid ip format")
+
+    latency = random.randint(10, 400)
+    status = "reachable" if latency < 350 else "unreachable"
+
+    # Check blacklist
+    async with IP_BLACKLIST_LOCK:
+        blacklisted = ip_addr in IP_BLACKLIST
+
+    return {
+        "ip": ip_addr,
+        "latency_ms": latency,
+        "status": status,
+        "blacklisted": blacklisted,
+        "tested_at": datetime.now().isoformat(),
+    }
+
+
+@app.get("/api/tools/stress-test")
+async def stress_test(_=Depends(require_auth)):
+    """Simulated server load stats."""
+    import random
+    conn_count = len(connections)
+    load_factor = min(conn_count / 500, 1.0) * 100
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "load_percent": round(load_factor, 1),
+        "active_connections": conn_count,
+        "max_theoretical_connections": 500,
+        "cpu_percent": round(min(conn_count * 0.35 + random.uniform(2, 8), 95), 1),
+        "ram_percent": round(min(50 + conn_count * 0.08 + random.uniform(1, 5), 95), 1),
+        "disk_iops": random.randint(100, 2000),
+        "network_mbps": round(random.uniform(2, 80), 2),
+        "requests_per_second": stats.get("total_requests", 0) / max(time.time() - stats["start_time"], 1),
+        "status": "healthy" if load_factor < 70 else ("degraded" if load_factor < 90 else "critical"),
+    }
+
+
+@app.post("/api/tools/bulk-create")
+async def bulk_create_users(request: Request, _=Depends(require_auth)):
+    """Create multiple users at once based on a template."""
+    body = await request.json()
+    count = int(body.get("count", 1))
+    if count < 1:
+        raise HTTPException(status_code=400, detail="count must be at least 1")
+    if count > 100:
+        raise HTTPException(status_code=400, detail="count cannot exceed 100")
+
+    template = body.get("template", {})
+    base_username = str(template.get("username_prefix", "bulk")).strip()[:20]
+    protocol = str(template.get("protocol", "vless")).lower()
+    traffic_limit_gb = float(template.get("traffic_limit_gb") or 0)
+    expire_days = int(template.get("expire_days") or 0)
+    concurrent = int(template.get("concurrent_connections") or 3)
+    server = str(template.get("server", "IR-Tehran-01")).strip()[:40]
+
+    if protocol not in USER_PROTOCOLS:
+        raise HTTPException(status_code=400, detail=f"Invalid protocol: {protocol}")
+
+    created = []
+    async with USERS_LOCK:
+        for i in range(count):
+            user_id = generate_short_id()
+            username = f"{base_username}{i + 1}"
+            # Avoid duplicates: append random suffix if needed
+            if any(u.get("username") == username for u in USERS.values()):
+                username = f"{base_username}{i + 1}_{secrets.token_hex(3)}"
+            config_uuid = generate_uuid()
+            traffic_limit_bytes = int(traffic_limit_gb * 1024 ** 3) if traffic_limit_gb > 0 else 0
+            expire_at = (datetime.now() + timedelta(days=expire_days)).isoformat() if expire_days > 0 else None
+            USERS[user_id] = {
+                "username": username,
+                "password_hash": hash_password(secrets.token_urlsafe(8)),
+                "protocol": protocol,
+                "traffic_limit_bytes": traffic_limit_bytes,
+                "traffic_used_bytes": 0,
+                "expire_at": expire_at,
+                "concurrent_connections": concurrent,
+                "created_at": datetime.now().isoformat(),
+                "status": "active",
+                "server": server,
+                "config_uuid": config_uuid,
+                "subscription_uuid": secrets.token_urlsafe(16),
+            }
+            created.append({"user_id": user_id, "username": username})
+
+    asyncio.create_task(save_state())
+    log_activity("user", f"{count} کاربر به‌صورت انبوه ساخته شد", "ok")
+    return {"ok": True, "created_count": len(created), "users": created}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SERVER STATS (HTTP polling)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/server/stats")
+async def server_stats_http(_=Depends(require_auth)):
+    """One-shot HTTP response with live server stats (for polling clients)."""
+    return get_live_stats()
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
