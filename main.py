@@ -11,6 +11,10 @@ from urllib.parse import quote
 from collections import deque, defaultdict
 import base64
 import io
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("RVG-Gateway")
 
 try:
     import qrcode
@@ -27,10 +31,6 @@ from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResp
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
-import logging
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("RVG-Gateway")
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
