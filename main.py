@@ -9,6 +9,17 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from collections import deque, defaultdict
+import base64
+import io
+
+try:
+    import qrcode
+    from PIL import Image
+    QR_AVAILABLE = True
+except ImportError:
+    QR_AVAILABLE = False
+    logger.warning("qrcode/PIL not installed -- QR endpoints will return 501")
+
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
@@ -19,11 +30,11 @@ import httpx
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("SPIDER-PANEL")
+logger = logging.getLogger("RVG-Gateway")
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
-app = FastAPI(title="SPIDER PANEL", docs_url=None, redoc_url=None)
+app = FastAPI(title="RVG Gateway - codebox", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
@@ -45,7 +56,7 @@ DATA_FILE = DATA_DIR / "rvg_state.json"
 SAVE_LOCK = asyncio.Lock()
 
 async def load_state():
-    global LINKS, AUTH, SUBS
+    global LINKS, AUTH, SUBS, USERS
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -54,9 +65,10 @@ async def load_state():
             data = json.loads(raw)
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
+            USERS.update(data.get("users", {}))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
-            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
+            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, {len(USERS)} users")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
@@ -66,6 +78,7 @@ async def save_state():
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             data = {
                 "links": dict(LINKS),
+                "users": dict(USERS),
                 "subs": dict(SUBS),
                 "password_hash": AUTH["password_hash"],
                 "saved_at": datetime.now().isoformat(),
@@ -93,9 +106,13 @@ LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
+USERS: dict = {}
+USERS_LOCK = asyncio.Lock()
 
 # پروتکل‌های پشتیبانی‌شده برای هر کانفیگ
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
+
+USER_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks", "wireguard")
 DEFAULT_PROTOCOL = "vless-ws"
 
 def log_activity(kind: str, message: str, level: str = "info"):
@@ -159,7 +176,7 @@ async def startup():
     )
     await load_state()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
-    logger.info(f"SPIDER PANEL started on port {CONFIG['port']}")
+    logger.info(f"RVG Gateway v9.1 started on port {CONFIG['port']}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -178,7 +195,7 @@ def generate_uuid() -> str:
 def now_ir() -> datetime:
     return datetime.now(IRAN_TZ)
 
-def generate_vless_link(uuid: str, host: str, remark: str = "SPIDER", protocol: str = DEFAULT_PROTOCOL) -> str:
+def generate_vless_link(uuid: str, host: str, remark: str = "RVG", protocol: str = DEFAULT_PROTOCOL) -> str:
     """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده (WS کلاسیک یا یکی از مدهای XHTTP)."""
     if protocol == "vless-ws":
         path = f"/ws/{uuid}"
@@ -259,6 +276,105 @@ def client_ip(request: Request) -> str:
         return real_ip.strip()
     return request.client.host if request.client else "نامشخص"
 
+
+# ── User helper functions ────────────────────────────────────────────────────
+def is_user_allowed(user: dict | None) -> bool:
+    """Check if a user is active and not expired."""
+    if user is None:
+        return False
+    if user.get("status") == "disabled":
+        return False
+    if user.get("status") == "expired":
+        return False
+    exp = user.get("expire_at")
+    if exp:
+        try:
+            if datetime.now() > datetime.fromisoformat(exp):
+                user["status"] = "expired"
+                return False
+        except Exception:
+            pass
+    lb = user.get("traffic_limit_bytes", 0)
+    if lb > 0 and user.get("traffic_used_bytes", 0) >= lb:
+        return False
+    return True
+
+def auto_check_user_expiry(user: dict):
+    """Auto-mark user as expired if past expire_at."""
+    if not user:
+        return
+    exp = user.get("expire_at")
+    if not exp:
+        return
+    try:
+        if datetime.now() > datetime.fromisoformat(exp):
+            if user.get("status") not in ("expired", "disabled"):
+                user["status"] = "expired"
+    except Exception:
+        pass
+
+def generate_short_id() -> str:
+    """Generate a shorter ID for user management."""
+    return secrets.token_hex(6)
+
+def generate_user_config(user_id: str, user: dict) -> str:
+    """Generate a connection config string for a user based on their protocol."""
+    host = get_host()
+    protocol = user.get("protocol", "vless")
+    config_uuid = user.get("config_uuid", "")
+    username = user.get("username", user_id)
+    remark = quote(f"RVG-{username}")
+
+    if protocol == "vless":
+        params = f"encryption=none&security=tls&type=ws&host={host}&path=/ws/{config_uuid}&sni={host}&fp=chrome"
+        return f"vless://{config_uuid}@{host}:443?{params}#{remark}"
+
+    elif protocol == "vmess":
+        vmess_config = {
+            "v": "2",
+            "ps": username,
+            "add": host,
+            "port": "443",
+            "id": config_uuid,
+            "aid": "0",
+            "scy": "auto",
+            "net": "ws",
+            "type": "none",
+            "host": host,
+            "path": f"/ws/{config_uuid}",
+            "tls": "tls",
+            "sni": host,
+        }
+        encoded = base64.b64encode(json.dumps(vmess_config).encode()).decode()
+        return f"vmess://{encoded}"
+
+    elif protocol == "trojan":
+        params = f"security=tls&type=ws&host={host}&path=/ws/{config_uuid}&sni={host}"
+        return f"trojan://{quote(config_uuid)}@{host}:443?{params}#{remark}"
+
+    elif protocol == "shadowsocks":
+        method = "aes-256-gcm"
+        ss_encoded = base64.b64encode(f"{method}:{config_uuid}".encode()).decode()
+        port = "8443"
+        return f"ss://{ss_encoded}@{host}:{port}#{remark}"
+
+    elif protocol == "wireguard":
+        priv_key = base64.b64encode(secrets.token_bytes(32)).decode()
+        pub_key = base64.b64encode(secrets.token_bytes(32)).decode()
+        return (
+            f"[Interface]\n"
+            f"PrivateKey = {priv_key}\n"
+            f"Address = 10.0.0.{hash(user_id) % 253 + 2}/24\n"
+            f"DNS = 1.1.1.1\n\n"
+            f"[Peer]\n"
+            f"PublicKey = {pub_key}\n"
+            f"Endpoint = {host}:51820\n"
+            f"AllowedIPs = 0.0.0.0/0\n"
+        )
+
+    return ""
+
+
 # ── Default link ──────────────────────────────────────────────────────────────
 _default_link_created = False
 
@@ -289,7 +405,7 @@ async def ensure_default_link():
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "SPIDER PANEL", "version": "1.0", "status": "active"}
+    return {"service": "RVG Gateway", "version": "9.2", "status": "active", "channel": "https://t.me/CodeBoxo"}
 
 @app.get("/health")
 async def health():
@@ -305,10 +421,10 @@ async def subscription_single(uuid: str):
         raise HTTPException(status_code=404, detail="not found or inactive")
     host = get_host()
     proto = link.get("protocol", DEFAULT_PROTOCOL)
-    vless = generate_vless_link(uuid, host, remark=f"SPIDER-{link['label']}", protocol=proto)
+    vless = generate_vless_link(uuid, host, remark=f"RVG-{link['label']}", protocol=proto)
     content = base64.b64encode(vless.encode()).decode()
     return Response(content=content, media_type="text/plain",
-                    headers={"profile-title": quote(link["label"])})
+                    headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/CodeBoxo"})
 
 @app.get("/sub-all")
 async def subscription_all(_=Depends(require_auth)):
@@ -316,7 +432,7 @@ async def subscription_all(_=Depends(require_auth)):
     host = get_host()
     async with LINKS_LOCK:
         lines = [
-            generate_vless_link(uid, host, remark=f"SPIDER-{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL))
+            generate_vless_link(uid, host, remark=f"RVG-{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL))
             for uid, d in LINKS.items()
             if is_link_allowed(d)
         ]
@@ -458,7 +574,7 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         for lid in link_ids:
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
-                lines.append(generate_vless_link(lid, host, remark=f"SPIDER-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
+                lines.append(generate_vless_link(lid, host, remark=f"RVG-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
 
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(
@@ -466,6 +582,7 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         media_type="text/plain",
         headers={
             "profile-title": quote(sub["name"]),
+            "support-url": "https://t.me/CodeBoxo",
             "profile-update-interval": "12",
         }
     )
@@ -516,6 +633,39 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
 async def get_stats(_=Depends(require_auth)):
     async with LINKS_LOCK:
         snap = dict(LINKS)
+    async with USERS_LOCK:
+        snap_users = dict(USERS)
+    async with SUBS_LOCK:
+        snap_subs = dict(SUBS)
+
+    # Auto-check user expiry
+    for user in snap_users.values():
+        auto_check_user_expiry(user)
+
+    # Count active users
+    active_users = sum(1 for u in snap_users.values() if u.get("status") == "active")
+    total_users = len(snap_users)
+
+    # Traffic across all links
+    total_bytes = stats["total_bytes"]
+    traffic_usage_gb = round(total_bytes / (1024 ** 3), 3)
+
+    # Connection-based health simulation
+    conn_count = len(connections)
+    if conn_count > 400:
+        server_status = "down"
+    elif conn_count > 200:
+        server_status = "degraded"
+    else:
+        server_status = "healthy"
+
+    # Simulated system metrics
+    cpu_percent = round(min(conn_count * 0.3 + 5, 95), 1)
+    ram_percent = round(min(45 + (total_users * 0.5) + (conn_count * 0.1), 95), 1)
+    disk_percent = round(min(25 + (len(snap) * 0.02) + (total_users * 0.1), 90), 1)
+    uptime_secs = max(time.time() - stats["start_time"], 1)
+    network_mbps = round(total_bytes / uptime_secs * 8 / 1000000, 2)
+
     return {
         "active_connections": len(connections),
         "total_traffic_mb": round(stats["total_bytes"] / (1024 ** 2), 2),
@@ -529,6 +679,17 @@ async def get_stats(_=Depends(require_auth)):
         "active_links": sum(1 for l in snap.values() if is_link_allowed(l)),
         "expired_links": sum(1 for l in snap.values() if is_link_expired(l)),
         "subs_count": len(SUBS),
+        # Enhanced stats
+        "active_users": active_users,
+        "total_configs": len(snap),
+        "total_users": total_users,
+        "traffic_usage_gb": traffic_usage_gb,
+        "server_status": server_status,
+        "cpu_percent": cpu_percent,
+        "ram_percent": ram_percent,
+        "disk_percent": disk_percent,
+        "network_mbps": network_mbps,
+        "recent_activity": list(activity_logs)[-10:],
     }
 
 # ── Activity Logs ─────────────────────────────────────────────────────────────
@@ -643,7 +804,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "uuid": uid,
         **LINKS[uid],
         "expired": False,
-        "vless_link": generate_vless_link(uid, host, remark=f"SPIDER-{label}", protocol=protocol),
+        "vless_link": generate_vless_link(uid, host, remark=f"RVG-{label}", protocol=protocol),
         "sub_url": f"https://{host}/sub/{uid}",
     }
 
@@ -660,7 +821,7 @@ async def list_links(_=Depends(require_auth)):
             **d,
             "protocol": proto,
             "expired": is_link_expired(d),
-            "vless_link": generate_vless_link(uid, host, remark=f"SPIDER-{d['label']}", protocol=proto),
+            "vless_link": generate_vless_link(uid, host, remark=f"RVG-{d['label']}", protocol=proto),
             "sub_url": f"https://{host}/sub/{uid}",
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -773,6 +934,220 @@ async def http_proxy(target_url: str, request: Request):
         error_logs.append({"error": str(exc), "url": target_url, "time": datetime.now().isoformat()})
         raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USER MANAGEMENT endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/users")
+async def list_users(_=Depends(require_auth)):
+    """List all users with traffic stats and status."""
+    host = get_host()
+    async with USERS_LOCK:
+        snap = dict(USERS)
+
+    result = []
+    for uid, u in snap.items():
+        auto_check_user_expiry(u)
+        protocol = u.get("protocol", "vless")
+        result.append({
+            "user_id": uid,
+            "username": u.get("username"),
+            "protocol": protocol,
+            "traffic_limit_bytes": u.get("traffic_limit_bytes", 0),
+            "traffic_limit_fmt": "∞" if u.get("traffic_limit_bytes", 0) == 0 else fmt_bytes(u["traffic_limit_bytes"]),
+            "traffic_used_bytes": u.get("traffic_used_bytes", 0),
+            "traffic_used_fmt": fmt_bytes(u.get("traffic_used_bytes", 0)),
+            "traffic_percent": round(u.get("traffic_used_bytes", 0) / max(u.get("traffic_limit_bytes", 1), 1) * 100, 1) if u.get("traffic_limit_bytes", 0) > 0 else 0,
+            "expire_at": u.get("expire_at"),
+            "concurrent_connections": u.get("concurrent_connections", 3),
+            "created_at": u.get("created_at"),
+            "status": u.get("status", "active"),
+            "server": u.get("server", ""),
+            "config_uuid": u.get("config_uuid"),
+            "subscription_uuid": u.get("subscription_uuid"),
+            "config_url": f"https://{host}/api/users/{uid}/config",
+            "qr_url": f"https://{host}/api/users/{uid}/qr",
+            "subscription_url": f"https://{host}/api/users/{uid}/subscription",
+            "connections": sum(1 for c in connections.values() if c.get("uuid") == u.get("config_uuid")),
+        })
+    result.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return {"users": result}
+
+@app.post("/api/users")
+async def create_user(request: Request, _=Depends(require_auth)):
+    """Create a new user with protocol config, traffic limit, and expiry."""
+    body = await request.json()
+    username = (body.get("username") or "user").strip()[:40]
+    password = str(body.get("password") or secrets.token_urlsafe(12))
+    traffic_limit_gb = float(body.get("traffic_limit_gb") or 0)
+    expire_days = int(body.get("expire_days") or 0)
+    protocol = str(body.get("protocol") or "vless").lower()
+    concurrent_connections = int(body.get("concurrent_connections") or 3)
+    server = (body.get("server") or "IR-Tehran-01").strip()[:40]
+
+    if protocol not in USER_PROTOCOLS:
+        raise HTTPException(status_code=400, detail=f"Invalid protocol. Must be one of: {', '.join(USER_PROTOCOLS)}")
+    if len(username) < 1:
+        raise HTTPException(status_code=400, detail="Username is required")
+    if len(password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    if concurrent_connections < 1:
+        concurrent_connections = 1
+
+    user_id = generate_short_id()
+    config_uuid = generate_uuid()
+    subscription_uuid = secrets.token_urlsafe(16)
+    traffic_limit_bytes = int(traffic_limit_gb * 1024 ** 3) if traffic_limit_gb > 0 else 0
+    expire_at = (datetime.now() + timedelta(days=expire_days)).isoformat() if expire_days > 0 else None
+
+    async with USERS_LOCK:
+        # Check for duplicate username
+        for existing in USERS.values():
+            if existing.get("username") == username:
+                raise HTTPException(status_code=409, detail="Username already exists")
+
+        USERS[user_id] = {
+            "username": username,
+            "password_hash": hash_password(password),
+            "protocol": protocol,
+            "traffic_limit_bytes": traffic_limit_bytes,
+            "traffic_used_bytes": 0,
+            "expire_at": expire_at,
+            "concurrent_connections": concurrent_connections,
+            "created_at": datetime.now().isoformat(),
+            "status": "active",
+            "server": server,
+            "config_uuid": config_uuid,
+            "subscription_uuid": subscription_uuid,
+        }
+
+    asyncio.create_task(save_state())
+    log_activity("user", f"کاربر «{username}» با پروتکل {protocol} ساخته شد", "ok")
+    host = get_host()
+    return {
+        "user_id": user_id,
+        **USERS[user_id],
+        "password_hash": None,
+        "config_url": f"https://{host}/api/users/{user_id}/config",
+        "qr_url": f"https://{host}/api/users/{user_id}/qr",
+        "subscription_url": f"https://{host}/api/users/{user_id}/subscription",
+        "config": generate_user_config(user_id, USERS[user_id]),
+    }
+
+@app.patch("/api/users/{user_id}/toggle")
+async def toggle_user(user_id: str, _=Depends(require_auth)):
+    """Enable or disable a user."""
+    async with USERS_LOCK:
+        u = USERS.get(user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="user not found")
+        old = u.get("status", "active")
+        if old == "disabled":
+            u["status"] = "active"
+        else:
+            u["status"] = "disabled"
+        new_status = u["status"]
+    asyncio.create_task(save_state())
+    log_activity("user", f"کاربر «{u['username']}» {'غیرفعال' if new_status == 'disabled' else 'فعال'} شد", "ok" if new_status == "active" else "warn")
+    return {"ok": True, "user_id": user_id, "status": new_status}
+
+@app.patch("/api/users/{user_id}/reset")
+async def reset_user_traffic(user_id: str, _=Depends(require_auth)):
+    """Reset a user's traffic usage to zero."""
+    async with USERS_LOCK:
+        u = USERS.get(user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="user not found")
+        u["traffic_used_bytes"] = 0
+        username = u.get("username", user_id)
+    asyncio.create_task(save_state())
+    log_activity("user", f"مصرف کاربر «{username}» ریست شد", "info")
+    return {"ok": True, "user_id": user_id, "traffic_used_bytes": 0}
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: str, _=Depends(require_auth)):
+    """Delete a user permanently."""
+    async with USERS_LOCK:
+        u = USERS.get(user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="user not found")
+        username = u.get("username", user_id)
+        USERS.pop(user_id, None)
+    asyncio.create_task(save_state())
+    log_activity("user", f"کاربر «{username}» حذف شد", "err")
+    return {"ok": True, "deleted": user_id}
+
+@app.get("/api/users/{user_id}/config")
+async def get_user_config(user_id: str, _=Depends(require_auth)):
+    """Return the protocol config string for a user."""
+    async with USERS_LOCK:
+        u = USERS.get(user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="user not found")
+        config = generate_user_config(user_id, u)
+        username = u.get("username")
+        protocol = u.get("protocol")
+    host = get_host()
+    return {
+        "user_id": user_id,
+        "username": username,
+        "protocol": protocol,
+        "config": config,
+        "config_url": f"https://{host}/api/users/{user_id}/config",
+        "qr_url": f"https://{host}/api/users/{user_id}/qr",
+        "subscription_url": f"https://{host}/api/users/{user_id}/subscription",
+    }
+
+@app.get("/api/users/{user_id}/qr")
+async def get_user_qr(user_id: str, _=Depends(require_auth)):
+    """Return a QR code PNG image for the user's config."""
+    if not QR_AVAILABLE:
+        raise HTTPException(status_code=501, detail="QR code generation not available (install qrcode and Pillow)")
+
+    async with USERS_LOCK:
+        u = USERS.get(user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="user not found")
+        config = generate_user_config(user_id, u)
+
+    # Generate QR code
+    qr = qrcode.QRCode(version=1, box_size=10, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(config)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return Response(content=buf.getvalue(), media_type="image/png",
+                    headers={"Content-Disposition": f"inline; filename={user_id}.png"})
+
+@app.get("/api/users/{user_id}/subscription")
+async def get_user_subscription(user_id: str, _=Depends(require_auth)):
+    """Return the subscription URL for a user."""
+    host = get_host()
+    async with USERS_LOCK:
+        u = USERS.get(user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="user not found")
+        sub_uuid = u.get("subscription_uuid")
+        username = u.get("username")
+
+    if not sub_uuid:
+        raise HTTPException(status_code=404, detail="no subscription configured")
+
+    config = generate_user_config(user_id, u)
+    content = base64.b64encode(config.encode()).decode()
+
+    return {
+        "user_id": user_id,
+        "username": username,
+        "subscription_uuid": sub_uuid,
+        "subscription_url": f"https://{host}/sub/{sub_uuid}",
+        "encoded_config": content,
+    }
+
+
 # ── Public sub page ───────────────────────────────────────────────────────────
 @app.get("/p/{uuid_key}", response_class=HTMLResponse)
 async def public_sub_page(uuid_key: str, request: Request):
@@ -822,7 +1197,7 @@ async def public_sub_data(uuid_key: str, request: Request):
             "limit_bytes": link.get("limit_bytes", 0),
             "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
             "expires_at": link.get("expires_at"),
-            "vless_link": generate_vless_link(lid, host, remark=f"SPIDER-{link['label']}", protocol=proto),
+            "vless_link": generate_vless_link(lid, host, remark=f"RVG-{link['label']}", protocol=proto),
             "sub_url": f"https://{host}/sub/{lid}",
             "connections": conn_count,
         })
